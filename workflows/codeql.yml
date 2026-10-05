@@ -1,0 +1,47 @@
+name: CodeQL
+
+# GitHub-native SAST. Free for public repos. Catches injection, taint, deserialization,
+# and other common security bugs in JS/TS and Rust before they merge.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    # Weekly full scan, even when nothing has changed (catches new rule additions).
+    - cron: "30 9 * * 1"
+
+permissions:
+  contents: read
+  security-events: write
+  actions: read
+
+jobs:
+  analyze:
+    name: Analyze (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        # We don't analyze "rust" here — CodeQL Rust support is in beta as of
+        # 2025 and overlaps with cargo-audit + clippy. Re-enable once GA.
+        language: ["javascript-typescript"]
+
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@458d36d7d4f47d0dd16ca424c1d3cda0060f1360 # v3.35.5
+        with:
+          languages: ${{ matrix.language }}
+          # security-extended catches more issues than the default suite.
+          queries: security-extended
+
+      - name: Autobuild
+        uses: github/codeql-action/autobuild@458d36d7d4f47d0dd16ca424c1d3cda0060f1360 # v3.35.5
+
+      - name: Perform CodeQL analysis
+        uses: github/codeql-action/analyze@458d36d7d4f47d0dd16ca424c1d3cda0060f1360 # v3.35.5
+        with:
+          category: "/language:${{ matrix.language }}"

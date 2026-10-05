@@ -1,0 +1,176 @@
+// Copyright 2022-2026 Geraldo Ferreira Viana Júnior
+// Licensed under the Apache License, Version 2.0
+// https://github.com/veesker-cloud/veesker-community-edition
+
+export type ChartType = "bar" | "bar-h" | "line" | "pie" | "kpi" | "table";
+export type ChartAggregation = "none" | "sum" | "avg" | "count" | "max" | "min";
+
+export type ChartConfig = {
+  type: ChartType | null;
+  xColumn: string | null;
+  yColumns: string[];
+  aggregation: ChartAggregation;
+  title: string | null;
+};
+
+export type PreviewData = {
+  labels: string[];
+  datasets: { label: string; data: number[] }[];
+};
+
+export type ChartConfigureResult = {
+  config: ChartConfig;
+  previewData: PreviewData | null;
+  ready: boolean;
+};
+
+type ConfigureParams = {
+  sessionId: string;
+  patch: Partial<ChartConfig>;
+  columns: { name: string; dataType: string }[];
+  rows: unknown[][];
+};
+
+const NUMERIC_TYPES = new Set([
+  "NUMBER", "INTEGER", "FLOAT", "DECIMAL", "BINARY_FLOAT", "BINARY_DOUBLE",
+  "SMALLINT", "INT", "DOUBLE PRECISION", "REAL",
+]);
+
+function isNumericCol(columns: { name: string; dataType: string }[], colName: string): boolean {
+  const col = columns.find((c) => c.name === colName);
+  if (!col) return false;
+  const baseType = col.dataType.toUpperCase().split("(")[0].trim();
+  return NUMERIC_TYPES.has(baseType);
+}
+
+// 64 chart sessions ≈ 250 KB memory ceiling (config objects are small); evict LRU when exceeded.
+const MAX_SESSIONS = 64;
+const sessions = new Map<string, ChartConfig>();
+
+function touchSession(id: string) {
+  const cfg = sessions.get(id);
+  if (cfg) {
+    // Re-insert to move to end of Map iteration order (LRU: least-recently-used at front)
+    sessions.delete(id);
+    sessions.set(id, cfg);
+  }
+}
+
+function evictLruSession() {
+  if (sessions.size >= MAX_SESSIONS) {
+    sessions.delete(sessions.keys().next().value!);
+  }
+}
+
+function emptyConfig(): ChartConfig {
+  return { type: null, xColumn: null, yColumns: [], aggregation: "none", title: null };
+}
+
+function colIndex(columns: { name: string }[], name: string): number {
+  return columns.findIndex((c) => c.name === name);
+}
+
+function applyAgg(values: number[], agg: ChartAggregation): number {
+  if (values.length === 0) return 0;
+  switch (agg) {
+    case "sum": return values.reduce((a, b) => a + b, 0);
+    case "avg": return values.reduce((a, b) => a + b, 0) / values.length;
+    case "count": return values.length;
+    case "max": return values.reduce((a, b) => (b > a ? b : a), values[0]);
+    case "min": return values.reduce((a, b) => (b < a ? b : a), values[0]);
+    default: return values[0];
+  }
+}
+
+function buildPreview(
+  config: ChartConfig,
+  columns: { name: string; dataType: string }[],
+  rows: unknown[][]
+): PreviewData | null {
+  if (!config.type || config.yColumns.length === 0) return null;
+  if (config.type === "table") return null;
+
+  if (config.type === "kpi") {
+    const datasets = config.yColumns.map((yCol) => {
+      const yi = colIndex(columns, yCol);
+      if (yi === -1) return { label: yCol, data: [0] };
+      const values = rows.map((r) => Number(r[yi]) || 0);
+      return { label: yCol, data: [applyAgg(values, config.aggregation)] };
+    });
+    return { labels: [], datasets };
+  }
+
+  if (!config.xColumn) return null;
+  const xi = colIndex(columns, config.xColumn);
+  if (xi === -1) return null;
+
+  const labelSet: string[] = [];
+  const seen = new Set<string>();
+  for (const row of rows) {
+    const label = String(row[xi] ?? "");
+    if (!seen.has(label)) {
+      seen.add(label);
+      labelSet.push(label);
+    }
+  }
+
+  // Reject non-numeric Y columns for aggregations that require numeric math.
+  // For "count" we count rows (any type). For "none" we still need numbers
+  // because the chart will plot bar/line heights — DATE/VARCHAR coerced to 0
+  // produces visually-empty charts that look broken to the user.
+  if (config.aggregation !== "count") {
+    const nonNumeric = config.yColumns.filter((yCol) => !isNumericCol(columns, yCol));
+    if (nonNumeric.length > 0) {
+      return null;
+    }
+  }
+
+  const datasets = config.yColumns.map((yCol) => {
+    const yi = colIndex(columns, yCol);
+    if (yi === -1) return { label: yCol, data: labelSet.map(() => 0) };
+    const groups = new Map<string, number[]>();
+    for (const label of labelSet) groups.set(label, []);
+    for (const row of rows) {
+      const label = String(row[xi] ?? "");
+      if (groups.has(label)) groups.get(label)!.push(Number(row[yi]) || 0);
+    }
+    const data = labelSet.map((label) => applyAgg(groups.get(label)!, config.aggregation));
+    return { label: yCol, data };
+  });
+
+  return { labels: labelSet, datasets };
+}
+
+function isReady(config: ChartConfig): boolean {
+  if (!config.type || config.yColumns.length === 0 || !config.title) return false;
+  if (config.type === "kpi" || config.type === "table") return true;
+  return config.xColumn !== null;
+}
+
+export async function chartConfigure(p: ConfigureParams): Promise<ChartConfigureResult> {
+  const config = sessions.get(p.sessionId) ?? emptyConfig();
+  const patch = p.patch;
+
+  if (patch.type !== undefined && patch.type !== null) config.type = patch.type;
+  if (patch.xColumn !== undefined && patch.xColumn !== null) config.xColumn = patch.xColumn;
+  if (patch.yColumns !== undefined) config.yColumns = patch.yColumns;
+  if (patch.aggregation !== undefined && patch.aggregation !== null) config.aggregation = patch.aggregation;
+  if (patch.title !== undefined && patch.title !== null) config.title = patch.title;
+
+  if (sessions.has(p.sessionId)) {
+    touchSession(p.sessionId);
+  } else {
+    evictLruSession();
+  }
+  sessions.set(p.sessionId, config);
+
+  const previewData = buildPreview(config, p.columns, p.rows);
+  const ready = isReady(config) && (previewData !== null || config.type === "table");
+
+  return { config: { ...config }, previewData, ready };
+}
+
+export function chartReset(p: { sessionId: string }): { ok: true } {
+  sessions.delete(p.sessionId);
+  return { ok: true };
+}

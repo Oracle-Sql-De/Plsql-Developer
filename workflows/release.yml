@@ -1,0 +1,140 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  create-release:
+    runs-on: ubuntu-latest
+    outputs:
+      release_id: ${{ steps.release.outputs.result }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Create draft release
+        id: release
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7.1.0
+        with:
+          script: |
+            const tag = context.ref.replace('refs/tags/', '')
+            const { data } = await github.rest.repos.createRelease({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              tag_name: tag,
+              name: `Veesker ${tag}`,
+              draft: true,
+              generate_release_notes: false,
+            })
+            return data.id
+          result-encoding: string
+
+  build:
+    needs: create-release
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows-latest
+            sidecar-cmd: build:win-x64
+            rust-targets: ''
+            tauri-args: '--bundles nsis'
+          - platform: macos-14
+            sidecar-cmd: build:mac-arm64
+            rust-targets: aarch64-apple-darwin
+            tauri-args: --target aarch64-apple-darwin
+          - platform: ubuntu-22.04
+            sidecar-cmd: build:linux-x64
+            rust-targets: ''
+            tauri-args: '--bundles deb,rpm'
+
+    runs-on: ${{ matrix.platform }}
+    timeout-minutes: ${{ matrix.timeout || 90 }}
+    continue-on-error: ${{ matrix.platform == 'ubuntu-22.04' }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install Linux system deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf squashfs-tools libfuse2
+
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust-targets }}
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install frontend deps
+        run: bun install
+
+      - name: Install sidecar deps
+        working-directory: sidecar
+        run: bun install
+
+      - name: Build sidecar
+        working-directory: sidecar
+        run: bun run ${{ matrix.sidecar-cmd }}
+
+      - name: Pin cargo to rustup proxy (workaround macOS Homebrew shim)
+        if: startsWith(matrix.platform, 'macos')
+        shell: bash
+        run: echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+
+      - name: Build and upload
+        uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5 # v0.6.2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          APPIMAGE_EXTRACT_AND_RUN: 1
+        with:
+          releaseId: ${{ needs.create-release.outputs.release_id }}
+          args: ${{ matrix.tauri-args }}
+          includeUpdaterJson: true
+          updaterJsonPreferNsis: true
+
+  publish:
+    needs: [create-release, build]
+    runs-on: ubuntu-latest
+    if: always() && needs.create-release.result == 'success'
+    steps:
+      - name: Publish release
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7.1.0
+        with:
+          script: |
+            await github.rest.repos.updateRelease({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              release_id: ${{ needs.create-release.outputs.release_id }},
+              draft: false,
+            })
+
+      - name: Update site version
+        env:
+          GH_TOKEN: ${{ secrets.SITE_DEPLOY_TOKEN }}
+        run: |
+          VERSION="${{ github.ref_name }}"
+          VERSION="${VERSION#v}"
+          git clone "https://x-access-token:${GH_TOKEN}@github.com/veesker-cloud/veesker-site.git" site
+          cd site
+          sed -i "s/const RELEASE = \"[^\"]*\"/const RELEASE = \"${VERSION}\"/" src/routes/download/+page.svelte
+          sed -i "s/\"softwareVersion\": \"[^\"]*\"/\"softwareVersion\": \"${VERSION}\"/" src/app.html
+          git config user.email "geraldovianajr@veesker.cloud"
+          git config user.name "gevianajr"
+          git add src/routes/download/+page.svelte src/app.html
+          git diff --cached --quiet || git commit -m "chore(release): bump version to ${VERSION}"
+          git push
